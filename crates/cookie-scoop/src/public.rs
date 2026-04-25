@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::providers::chromium::{
-    get_cookies_from_chromium, ChromiumBrowser, ChromiumOptions, CHROME, EDGE,
+    get_cookies_from_chromium, ChromiumBrowser, ChromiumOptions, CHROME, EDGE, HELIUM,
 };
 use crate::providers::firefox::{get_cookies_from_firefox, FirefoxOptions};
 use crate::providers::inline::{get_cookies_from_inline, InlineSource};
@@ -55,12 +55,16 @@ pub async fn get_cookies(options: GetCookiesOptions) -> GetCookiesResult {
 
     for browser in &browsers {
         let result = match browser {
-            BrowserName::Chrome | BrowserName::Edge => {
+            BrowserName::Chrome | BrowserName::Edge | BrowserName::Helium => {
                 let (browser, envs): (ChromiumBrowser, &[&str]) = match browser {
                     BrowserName::Chrome => (CHROME, &["SWEET_COOKIE_CHROME_PROFILE"]),
                     BrowserName::Edge => (
                         EDGE,
                         &["SWEET_COOKIE_EDGE_PROFILE", "SWEET_COOKIE_CHROME_PROFILE"],
+                    ),
+                    BrowserName::Helium => (
+                        HELIUM,
+                        &["SWEET_COOKIE_HELIUM_PROFILE", "SWEET_COOKIE_CHROME_PROFILE"],
                     ),
                     _ => unreachable!(),
                 };

@@ -26,6 +26,7 @@ pub struct ChromiumBrowser {
     pub name: BrowserName,
     label: &'static str,
     roots: fn() -> Vec<PathBuf>,
+    default_profiles: &'static [&'static str],
     #[cfg(target_os = "macos")]
     keychain_service: &'static str,
     #[cfg(target_os = "macos")]
@@ -49,6 +50,7 @@ pub const CHROME: ChromiumBrowser = ChromiumBrowser {
     name: BrowserName::Chrome,
     label: "Chrome",
     roots: chrome_roots,
+    default_profiles: &["Default"],
     #[cfg(target_os = "macos")]
     keychain_service: "Chrome Safe Storage",
     #[cfg(target_os = "macos")]
@@ -71,6 +73,7 @@ pub const EDGE: ChromiumBrowser = ChromiumBrowser {
     name: BrowserName::Edge,
     label: "Edge",
     roots: edge_roots,
+    default_profiles: &["Default"],
     #[cfg(target_os = "macos")]
     keychain_service: "Microsoft Edge Safe Storage",
     #[cfg(target_os = "macos")]
@@ -87,6 +90,29 @@ pub const EDGE: ChromiumBrowser = ChromiumBrowser {
     windows_user_data: "Microsoft\\Edge\\User Data",
     #[cfg(target_os = "windows")]
     windows_key_label: "Edge",
+};
+
+pub const HELIUM: ChromiumBrowser = ChromiumBrowser {
+    name: BrowserName::Helium,
+    label: "Helium",
+    roots: helium_roots,
+    default_profiles: &["Default", "Profile 1"],
+    #[cfg(target_os = "macos")]
+    keychain_service: "Helium Safe Storage",
+    #[cfg(target_os = "macos")]
+    keychain_accounts: &["Helium Safe Storage", "Helium"],
+    #[cfg(target_os = "linux")]
+    linux_keyring: LinuxKeyringApp {
+        password_env: "SWEET_COOKIE_HELIUM_SAFE_STORAGE_PASSWORD",
+        service: "Chromium Safe Storage",
+        account: "Chromium",
+        folder: "Chromium Keys",
+        gnome_application: "chromium",
+    },
+    #[cfg(target_os = "windows")]
+    windows_user_data: "Helium\\User Data",
+    #[cfg(target_os = "windows")]
+    windows_key_label: "Helium",
 };
 
 pub async fn get_cookies_from_chromium(
@@ -255,7 +281,11 @@ async fn get_cookies_from_chromium_windows(
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn resolve_db(browser: ChromiumBrowser, options: &ChromiumOptions) -> Option<PathBuf> {
-    resolve_cookies_db_from_profile_or_roots(options.profile.as_deref(), &(browser.roots)())
+    resolve_cookies_db_from_profile_or_roots(
+        options.profile.as_deref(),
+        &(browser.roots)(),
+        browser.default_profiles,
+    )
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -315,6 +345,7 @@ fn expand_path(input: &str) -> PathBuf {
 fn resolve_cookies_db_from_profile_or_roots(
     profile: Option<&str>,
     roots: &[PathBuf],
+    default_profiles: &[&str],
 ) -> Option<PathBuf> {
     let profile = profile.filter(|profile| !profile.trim().is_empty());
 
@@ -329,14 +360,19 @@ fn resolve_cookies_db_from_profile_or_roots(
         };
     }
 
-    let profile = profile.unwrap_or("Default");
     roots.iter().find_map(|root| {
-        [
-            root.join(profile).join("Cookies"),
-            root.join(profile).join("Network/Cookies"),
-        ]
-        .into_iter()
-        .find(|candidate| candidate.exists())
+        let profiles: Vec<&str> = profile
+            .map(|profile| vec![profile])
+            .unwrap_or_else(|| default_profiles.to_vec());
+
+        profiles.into_iter().find_map(|profile| {
+            [
+                root.join(profile).join("Cookies"),
+                root.join(profile).join("Network/Cookies"),
+            ]
+            .into_iter()
+            .find(|candidate| candidate.exists())
+        })
     })
 }
 
@@ -381,6 +417,14 @@ fn edge_roots() -> Vec<PathBuf> {
     home_roots(&["Library/Application Support/Microsoft Edge"])
 }
 
+#[cfg(target_os = "macos")]
+fn helium_roots() -> Vec<PathBuf> {
+    home_roots(&[
+        "Library/Application Support/net.imput.helium",
+        "Library/Application Support/Helium",
+    ])
+}
+
 #[cfg(target_os = "linux")]
 fn chrome_roots() -> Vec<PathBuf> {
     config_roots(&["google-chrome"])
@@ -389,6 +433,11 @@ fn chrome_roots() -> Vec<PathBuf> {
 #[cfg(target_os = "linux")]
 fn edge_roots() -> Vec<PathBuf> {
     config_roots(&["microsoft-edge"])
+}
+
+#[cfg(target_os = "linux")]
+fn helium_roots() -> Vec<PathBuf> {
+    config_roots(&["net.imput.helium", "helium"])
 }
 
 #[cfg(target_os = "windows")]
@@ -401,6 +450,11 @@ fn edge_roots() -> Vec<PathBuf> {
     local_app_data_roots(&["Microsoft/Edge/User Data"])
 }
 
+#[cfg(target_os = "windows")]
+fn helium_roots() -> Vec<PathBuf> {
+    local_app_data_roots(&["net.imput.helium/User Data", "Helium/User Data"])
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn chrome_roots() -> Vec<PathBuf> {
     vec![]
@@ -408,6 +462,11 @@ fn chrome_roots() -> Vec<PathBuf> {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn edge_roots() -> Vec<PathBuf> {
+    vec![]
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn helium_roots() -> Vec<PathBuf> {
     vec![]
 }
 

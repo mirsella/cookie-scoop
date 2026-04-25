@@ -7,6 +7,7 @@ pub enum BrowserName {
     Chrome,
     Edge,
     Firefox,
+    Helium,
     Safari,
 }
 
@@ -16,6 +17,7 @@ impl BrowserName {
             "chrome" => Some(Self::Chrome),
             "edge" => Some(Self::Edge),
             "firefox" => Some(Self::Firefox),
+            "helium" | "helium-browser" | "helium_browser" => Some(Self::Helium),
             "safari" => Some(Self::Safari),
             _ => None,
         }
@@ -28,6 +30,7 @@ impl std::fmt::Display for BrowserName {
             Self::Chrome => write!(f, "chrome"),
             Self::Edge => write!(f, "edge"),
             Self::Firefox => write!(f, "firefox"),
+            Self::Helium => write!(f, "helium"),
             Self::Safari => write!(f, "safari"),
         }
     }
