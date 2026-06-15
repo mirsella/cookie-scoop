@@ -25,7 +25,9 @@ pub mod windows_master_key;
 pub struct ChromiumBrowser {
     pub name: BrowserName,
     label: &'static str,
+    #[allow(dead_code)]
     roots: fn() -> Vec<PathBuf>,
+    #[allow(dead_code)]
     default_profiles: &'static [&'static str],
     #[cfg(target_os = "macos")]
     keychain_service: &'static str,
@@ -279,7 +281,7 @@ async fn get_cookies_from_chromium_windows(
     .await
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn resolve_db(browser: ChromiumBrowser, options: &ChromiumOptions) -> Option<PathBuf> {
     resolve_cookies_db_from_profile_or_roots(
         options.profile.as_deref(),
@@ -316,6 +318,7 @@ fn warning(message: impl Into<String>) -> GetCookiesResult {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn with_warnings(mut warnings: Vec<String>, mut result: GetCookiesResult) -> GetCookiesResult {
     warnings.append(&mut result.warnings);
     result.warnings = warnings;
@@ -341,7 +344,7 @@ fn expand_path(input: &str) -> PathBuf {
             }
         })
 }
-
+#[cfg(not(target_os = "windows"))]
 fn resolve_cookies_db_from_profile_or_roots(
     profile: Option<&str>,
     roots: &[PathBuf],
