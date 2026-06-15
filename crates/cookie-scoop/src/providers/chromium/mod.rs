@@ -483,7 +483,7 @@ fn resolve_chromium_paths_windows(
     if let Some(profile) = profile.filter(|profile| looks_like_path(profile)) {
         let expanded = expand_path(profile);
         let candidates = if expanded.to_string_lossy().ends_with("Cookies") {
-            vec![expanded]
+            vec![expanded.clone()]
         } else {
             vec![
                 expanded.join("Network/Cookies"),
