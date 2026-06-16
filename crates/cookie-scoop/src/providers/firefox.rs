@@ -267,16 +267,11 @@ fn resolve_firefox_cookies_db(
 
         let entries = safe_readdir(root);
 
-        let mut priority = Vec::new();
-        let mut not_priority = Vec::new();
-
-        for entry in &entries {
-            if preferred_profile_markers.iter().any(|x| entry.contains(x)) {
-                priority.push(entry);
-            } else {
-                not_priority.push(entry);
-            }
-        }
+        let (mut priority, not_priority): (Vec<String>, Vec<String>) = entries
+            .into_iter()
+            .partition(|entry| preferred_profile_markers.iter().any(|x| entry.contains(x)));
+        
+        priority.reserve(not_priority.len());
         priority.extend(not_priority);
 
         for picked in priority {
