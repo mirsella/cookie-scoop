@@ -265,18 +265,21 @@ fn resolve_firefox_cookies_db(
             continue;
         }
 
-        let mut entries = safe_readdir(root);
+        let entries = safe_readdir(root);
 
-        // We loop over every entry to find cookies
-        // If the prefered profile doesn't have cookies, just use a profile that does... if one exists
-        for marker in preferred_profile_markers {
-            if let Some(pos) = entries.iter().position(|e| e.contains(marker)) {
-                entries.swap(0, pos);
-                break;
+        let mut priority = Vec::new();
+        let mut not_priority = Vec::new();
+
+        for entry in &entries {
+            if preferred_profile_markers.iter().any(|x| entry.contains(x)) {
+                priority.push(entry);
+            } else {
+                not_priority.push(entry);
             }
         }
+        priority.extend(not_priority);
 
-        for picked in entries {
+        for picked in priority {
             let candidate = root.join(picked).join("cookies.sqlite");
             if candidate.exists() {
                 return Some(candidate);
