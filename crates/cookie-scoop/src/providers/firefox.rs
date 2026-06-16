@@ -265,16 +265,7 @@ fn resolve_firefox_cookies_db(
             continue;
         }
 
-        let entries = safe_readdir(root);
-
-        let (mut priority, not_priority): (Vec<String>, Vec<String>) = entries
-            .into_iter()
-            .partition(|entry| preferred_profile_markers.iter().any(|x| entry.contains(x)));
-        
-        priority.reserve(not_priority.len());
-        priority.extend(not_priority);
-
-        for picked in priority {
+        for picked in profile_dirs(root, preferred_profile_markers) {
             let candidate = root.join(picked).join("cookies.sqlite");
             if candidate.exists() {
                 return Some(candidate);
@@ -344,8 +335,8 @@ fn zen_roots() -> Vec<PathBuf> {
     vec![]
 }
 
-fn safe_readdir(dir: &Path) -> Vec<String> {
-    std::fs::read_dir(dir)
+fn profile_dirs(dir: &Path, preferred_profile_markers: &[&str]) -> Vec<String> {
+    let mut dirs: Vec<String> = std::fs::read_dir(dir)
         .map(|entries| {
             entries
                 .filter_map(|e| e.ok())
@@ -353,7 +344,15 @@ fn safe_readdir(dir: &Path) -> Vec<String> {
                 .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    dirs.sort_by_key(|dir| {
+        preferred_profile_markers
+            .iter()
+            .position(|marker| dir.contains(marker))
+            .unwrap_or(preferred_profile_markers.len())
+    });
+    dirs
 }
 
 fn looks_like_path(value: &str) -> bool {
@@ -388,4 +387,22 @@ fn build_host_where_clause(hosts: &[String]) -> String {
 fn sql_literal(value: &str) -> String {
     let escaped = value.replace('\'', "''");
     format!("'{escaped}'")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_dirs_follow_marker_order_before_unmarked_profiles() {
+        let temp = tempfile::tempdir().unwrap();
+        for dir in ["unmarked-profile", "real.default", "empty.Default"] {
+            std::fs::create_dir(temp.path().join(dir)).unwrap();
+        }
+
+        assert_eq!(
+            profile_dirs(temp.path(), &["Default", "default"]),
+            ["empty.Default", "real.default", "unmarked-profile"]
+        );
+    }
 }
