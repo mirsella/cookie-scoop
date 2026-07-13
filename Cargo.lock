@@ -241,7 +241,7 @@ dependencies = [
 
 [[package]]
 name = "cookie-scoop"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "cookie-scoop-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "cookie-scoop",
