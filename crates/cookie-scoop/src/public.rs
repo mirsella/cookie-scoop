@@ -9,8 +9,8 @@ use crate::providers::firefox::{
 use crate::providers::inline::{get_cookies_from_inline, InlineSource};
 use crate::providers::safari::{get_cookies_from_safari, SafariOptions};
 use crate::types::{
-    normalize_names, BrowserName, Cookie, CookieHeaderOptions, CookieHeaderSort, CookieMode,
-    GetCookiesOptions, GetCookiesResult,
+    cookie_key, normalize_names, BrowserName, Cookie, CookieHeaderOptions, CookieHeaderSort,
+    CookieMode, GetCookiesOptions, GetCookiesResult,
 };
 use crate::util::origins::normalize_origins;
 
@@ -54,7 +54,7 @@ pub async fn get_cookies(options: GetCookiesOptions) -> GetCookiesResult {
         }
     }
 
-    let mut merged: HashMap<String, Cookie> = HashMap::new();
+    let mut merged = HashMap::new();
 
     for browser in &browsers {
         let result = match browser {
@@ -126,10 +126,7 @@ pub async fn get_cookies(options: GetCookiesOptions) -> GetCookiesResult {
         }
 
         for cookie in result.cookies {
-            let domain = cookie.domain.as_deref().unwrap_or("");
-            let path = cookie.path.as_deref().unwrap_or("");
-            let key = format!("{}|{}|{}", cookie.name, domain, path);
-            merged.entry(key).or_insert(cookie);
+            merged.entry(cookie_key(&cookie)).or_insert(cookie);
         }
     }
 

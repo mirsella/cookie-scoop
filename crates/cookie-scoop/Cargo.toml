@@ -24,6 +24,7 @@ sha1 = "0.10"
 url = "2"
 tempfile = "3"
 dirs = "5"
+lz4_flex = { version = "0.13", default-features = false, features = ["checked-decode", "safe-decode", "safe-encode", "std"] }
 tokio = { version = "1", features = ["process", "time", "rt", "macros", "fs"] }
 
 [dev-dependencies]

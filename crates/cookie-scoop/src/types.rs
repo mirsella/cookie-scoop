@@ -229,15 +229,47 @@ pub(crate) fn dedupe_cookies(cookies: Vec<Cookie>) -> Vec<Cookie> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
     for cookie in cookies {
-        let key = format!(
-            "{}|{}|{}",
-            cookie.name,
-            cookie.domain.as_deref().unwrap_or(""),
-            cookie.path.as_deref().unwrap_or("")
-        );
-        if seen.insert(key) {
+        if seen.insert(cookie_key(&cookie)) {
             result.push(cookie);
         }
     }
     result
+}
+
+pub(crate) fn cookie_key(cookie: &Cookie) -> (String, String, String) {
+    (
+        cookie.name.clone(),
+        cookie.domain.clone().unwrap_or_default(),
+        cookie.path.clone().unwrap_or_default(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dedupe_keeps_first_cookie_without_key_collisions() {
+        let cookie = |name: &str, domain: &str, value: &str| Cookie {
+            name: name.to_string(),
+            value: value.to_string(),
+            domain: Some(domain.to_string()),
+            path: Some("/".to_string()),
+            url: None,
+            expires: None,
+            secure: None,
+            http_only: None,
+            same_site: None,
+            source: None,
+        };
+        let cookies = dedupe_cookies(vec![
+            cookie("a|b", "c", "first"),
+            cookie("a|b", "c", "duplicate"),
+            cookie("a", "b|c", "distinct"),
+        ]);
+
+        assert_eq!(cookies.len(), 2);
+        assert_eq!(cookies[0].value, "first");
+        assert_eq!(cookies[1].value, "distinct");
+    }
 }

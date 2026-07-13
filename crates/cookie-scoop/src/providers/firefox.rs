@@ -5,13 +5,16 @@ use crate::types::{
     dedupe_cookies, BrowserName, Cookie, CookieSameSite, CookieSource, GetCookiesResult,
 };
 use crate::util::host_match::host_matches_cookie_domain;
+use serde::{Deserialize, Deserializer};
+use serde_json::Value;
 use url::Url;
+
+const MOZLZ4_HEADER: &[u8] = b"mozLz40\0";
 
 #[derive(Debug, Clone, Copy)]
 pub struct FirefoxBrowser {
     pub name: BrowserName,
     label: &'static str,
-    temp_prefix: &'static str,
     roots: fn() -> Vec<PathBuf>,
     preferred_profile_markers: &'static [&'static str],
 }
@@ -25,7 +28,6 @@ pub struct FirefoxOptions {
 pub const FIREFOX: FirefoxBrowser = FirefoxBrowser {
     name: BrowserName::Firefox,
     label: "Firefox",
-    temp_prefix: "cookie-scoop-firefox-",
     roots: firefox_roots,
     preferred_profile_markers: &["default-release"],
 };
@@ -33,7 +35,6 @@ pub const FIREFOX: FirefoxBrowser = FirefoxBrowser {
 pub const ZEN: FirefoxBrowser = FirefoxBrowser {
     name: BrowserName::Zen,
     label: "Zen",
-    temp_prefix: "cookie-scoop-zen-",
     roots: zen_roots,
     preferred_profile_markers: &["Default", "default"],
 };
@@ -44,28 +45,13 @@ pub async fn get_cookies_from_firefox(
     origins: &[String],
     allowlist_names: Option<&HashSet<String>>,
 ) -> GetCookiesResult {
-    let Some(db_path) = resolve_firefox_cookies_db(
+    let Some(profile_dir) = resolve_firefox_profile(
         options.profile.as_deref(),
         &(browser.roots)(),
         browser.preferred_profile_markers,
     ) else {
-        return warning(format!("{} cookies database not found.", browser.label));
+        return warning(format!("{} profile not found.", browser.label));
     };
-
-    let temp_dir = match tempfile::Builder::new()
-        .prefix(browser.temp_prefix)
-        .tempdir()
-    {
-        Ok(d) => d,
-        Err(e) => return warning(format!("Failed to create temp dir: {e}")),
-    };
-
-    let temp_db_path = temp_dir.path().join("cookies.sqlite");
-    if let Err(e) = std::fs::copy(&db_path, &temp_db_path) {
-        return warning(format!("Failed to copy {} cookie DB: {e}", browser.label));
-    }
-    copy_sidecar(&db_path, &temp_db_path, "-wal");
-    copy_sidecar(&db_path, &temp_db_path, "-shm");
 
     let hosts: Vec<String> = origins
         .iter()
@@ -75,153 +61,219 @@ pub async fn get_cookies_from_firefox(
                 .and_then(|u| u.host_str().map(|h| h.to_string()))
         })
         .collect();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
     let include_expired = options.include_expired.unwrap_or(false);
-
-    let where_clause = build_host_where_clause(&hosts);
-    let expiry_clause = if include_expired {
-        String::new()
-    } else {
-        format!(" AND (expiry = 0 OR expiry > {now})")
-    };
-    let sql = format!(
-        "SELECT name, value, host, path, expiry, isSecure, isHttpOnly, sameSite \
-         FROM moz_cookies WHERE ({where_clause}){expiry_clause} ORDER BY expiry DESC;"
-    );
-
-    let db_path_str = temp_db_path.to_string_lossy().to_string();
     let profile = options.profile.clone();
-    let browser_name = browser.name;
     let names_owned = allowlist_names.cloned();
     let result = tokio::task::spawn_blocking(move || {
-        query_firefox_cookies(
-            &db_path_str,
-            &sql,
-            &hosts,
-            include_expired,
-            names_owned.as_ref(),
-            profile.as_deref(),
-            browser_name,
-        )
+        let mut warnings = Vec::new();
+        let mut raw_cookies = match read_firefox_sessionstore(&profile_dir) {
+            Ok(cookies) => cookies,
+            Err(error) => {
+                warnings.push(format!(
+                    "Failed reading {} session cookies: {error}",
+                    browser.label
+                ));
+                Vec::new()
+            }
+        };
+        match read_firefox_database(&profile_dir) {
+            Ok(cookies) => raw_cookies.extend(cookies),
+            Err(error) => warnings.push(format!(
+                "Failed reading {} cookie database: {error}",
+                browser.label
+            )),
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let source = CookieSource {
+            browser: browser.name,
+            profile,
+            origin: None,
+            store_id: None,
+        };
+        let cookies = raw_cookies
+            .into_iter()
+            .filter_map(|cookie| {
+                cookie.into_cookie(&hosts, names_owned.as_ref(), include_expired, now, &source)
+            })
+            .collect();
+
+        GetCookiesResult {
+            cookies: dedupe_cookies(cookies),
+            warnings,
+        }
     })
     .await;
 
     match result {
-        Ok(Ok(cookies)) => GetCookiesResult {
-            cookies: dedupe_cookies(cookies),
-            warnings: vec![],
-        },
-        Ok(Err(e)) => warning(format!("Failed reading {} cookies: {e}", browser.label)),
+        Ok(result) => result,
         Err(e) => warning(format!("{} cookie task failed: {e}", browser.label)),
     }
 }
 
-fn query_firefox_cookies(
-    db_path: &str,
-    sql: &str,
-    hosts: &[String],
-    include_expired: bool,
-    allowlist_names: Option<&HashSet<String>>,
-    profile: Option<&str>,
-    browser: BrowserName,
-) -> Result<Vec<Cookie>, String> {
+#[derive(Debug, Deserialize)]
+struct FirefoxSessionStore {
+    #[serde(default)]
+    cookies: Vec<FirefoxCookie>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FirefoxCookie {
+    name: String,
+    value: String,
+    host: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    secure: bool,
+    #[serde(default, rename = "httponly")]
+    http_only: bool,
+    same_site: Option<i32>,
+    #[serde(default)]
+    expiry: i64,
+    #[serde(
+        default,
+        rename = "originAttributes",
+        deserialize_with = "deserialize_origin_attributes"
+    )]
+    isolated: bool,
+}
+
+impl FirefoxCookie {
+    fn into_cookie(
+        self,
+        hosts: &[String],
+        allowlist_names: Option<&HashSet<String>>,
+        include_expired: bool,
+        now: i64,
+        source: &CookieSource,
+    ) -> Option<Cookie> {
+        if self.name.is_empty()
+            || self.isolated
+            || allowlist_names.is_some_and(|names| !names.contains(&self.name))
+            || !hosts
+                .iter()
+                .any(|host| host_matches_cookie_domain(host, &self.host))
+        {
+            return None;
+        }
+
+        let expires = (self.expiry > 0).then_some(self.expiry);
+        if !include_expired && expires.is_some_and(|expiry| expiry <= now) {
+            return None;
+        }
+
+        Some(Cookie {
+            name: self.name,
+            value: self.value,
+            domain: Some(
+                self.host
+                    .strip_prefix('.')
+                    .unwrap_or(&self.host)
+                    .to_string(),
+            ),
+            path: Some(if self.path.is_empty() {
+                "/".to_string()
+            } else {
+                self.path
+            }),
+            url: None,
+            expires,
+            secure: Some(self.secure),
+            http_only: Some(self.http_only),
+            same_site: match self.same_site {
+                Some(2) => Some(CookieSameSite::Strict),
+                Some(1) => Some(CookieSameSite::Lax),
+                Some(0) => Some(CookieSameSite::None),
+                _ => None,
+            },
+            source: Some(source.clone()),
+        })
+    }
+}
+
+fn deserialize_origin_attributes<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    fn is_default(value: &Value) -> bool {
+        match value {
+            Value::Null => true,
+            Value::Bool(value) => !value,
+            Value::Number(value) => value.as_f64() == Some(0.0),
+            Value::String(value) => value.is_empty(),
+            Value::Array(values) => values.iter().all(is_default),
+            Value::Object(values) => values.values().all(is_default),
+        }
+    }
+
+    Value::deserialize(deserializer).map(|attributes| !is_default(&attributes))
+}
+
+fn read_firefox_sessionstore(profile_dir: &Path) -> Result<Vec<FirefoxCookie>, String> {
+    let sessionstore_paths = [
+        profile_dir.join("sessionstore-backups/recovery.jsonlz4"),
+        profile_dir.join("sessionstore.jsonlz4"),
+    ];
+    let Some(sessionstore_path) = sessionstore_paths.iter().find(|path| path.exists()) else {
+        return Ok(Vec::new());
+    };
+
+    let compressed = std::fs::read(sessionstore_path)
+        .map_err(|error| format!("read {}: {error}", sessionstore_path.display()))?;
+    let payload = compressed
+        .strip_prefix(MOZLZ4_HEADER)
+        .ok_or_else(|| format!("invalid mozLz4 header in {}", sessionstore_path.display()))?;
+    let json = lz4_flex::block::decompress_size_prepended(payload)
+        .map_err(|error| format!("decompress {}: {error}", sessionstore_path.display()))?;
+    let sessionstore: FirefoxSessionStore = serde_json::from_slice(&json)
+        .map_err(|error| format!("parse {}: {error}", sessionstore_path.display()))?;
+
+    Ok(sessionstore.cookies)
+}
+
+fn read_firefox_database(profile_dir: &Path) -> Result<Vec<FirefoxCookie>, String> {
+    let source_db_path = profile_dir.join("cookies.sqlite");
+    let temp_dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let temp_db_path = temp_dir.path().join("cookies.sqlite");
+    std::fs::copy(&source_db_path, &temp_db_path)
+        .map_err(|error| format!("copy {}: {error}", source_db_path.display()))?;
+    copy_sidecar(&source_db_path, &temp_db_path, "-wal")?;
+    copy_sidecar(&source_db_path, &temp_db_path, "-shm")?;
+
     let conn = rusqlite::Connection::open_with_flags(
-        db_path,
+        temp_db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|e| e.to_string())?;
 
-    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    let rows = stmt
-        .query_map([], |row| {
-            let name: String = row.get(0)?;
-            let value: String = row.get(1)?;
-            let host: String = row.get(2)?;
-            let path: String = row.get(3)?;
-            let expiry: i64 = row.get(4)?;
-            let is_secure: i32 = row.get(5)?;
-            let is_http_only: i32 = row.get(6)?;
-            let same_site: i32 = row.get(7)?;
-            Ok((
-                name,
-                value,
-                host,
-                path,
-                expiry,
-                is_secure,
-                is_http_only,
-                same_site,
-            ))
-        })
+    let mut stmt = conn
+        .prepare(
+            "SELECT name, value, host, path, expiry, isSecure, isHttpOnly, sameSite, \
+             originAttributes FROM moz_cookies ORDER BY expiry DESC;",
+        )
         .map_err(|e| e.to_string())?;
-
-    let mut cookies = Vec::new();
-    for row in rows {
-        let (name, value, host, path, expiry, is_secure, is_http_only, same_site) =
-            row.map_err(|e| e.to_string())?;
-
-        if name.is_empty() {
-            continue;
-        }
-        if allowlist_names.is_some_and(|names| !names.is_empty() && !names.contains(&name)) {
-            continue;
-        }
-
-        let cookie_domain = host.strip_prefix('.').unwrap_or(&host);
-        if !hosts
-            .iter()
-            .any(|h| host_matches_cookie_domain(h, cookie_domain))
-        {
-            continue;
-        }
-
-        let expires = if expiry > 0 { Some(expiry) } else { None };
-        if !include_expired && expires.is_some_and(|exp| exp < now) {
-            continue;
-        }
-
-        let domain = host.strip_prefix('.').unwrap_or(&host).to_string();
-        let same_site_val = match same_site {
-            2 => Some(CookieSameSite::Strict),
-            1 => Some(CookieSameSite::Lax),
-            0 => Some(CookieSameSite::None),
-            _ => None,
-        };
-
-        let source = CookieSource {
-            browser,
-            profile: profile.map(str::to_string),
-            origin: None,
-            store_id: None,
-        };
-
-        cookies.push(Cookie {
-            name,
-            value,
-            domain: Some(domain),
-            path: Some(if path.is_empty() {
-                "/".to_string()
-            } else {
-                path
-            }),
-            url: None,
-            expires,
-            secure: Some(is_secure != 0),
-            http_only: Some(is_http_only != 0),
-            same_site: same_site_val,
-            source: Some(source),
-        });
-    }
-
+    let cookies = stmt
+        .query_map([], |row| {
+            Ok(FirefoxCookie {
+                name: row.get(0)?,
+                value: row.get(1)?,
+                host: row.get(2)?,
+                path: row.get(3)?,
+                expiry: row.get(4)?,
+                secure: row.get::<_, i32>(5)? != 0,
+                http_only: row.get::<_, i32>(6)? != 0,
+                same_site: Some(row.get(7)?),
+                isolated: !row.get::<_, String>(8)?.is_empty(),
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
     Ok(cookies)
 }
 
@@ -232,24 +284,20 @@ fn warning(message: impl Into<String>) -> GetCookiesResult {
     }
 }
 
-fn resolve_firefox_cookies_db(
+fn resolve_firefox_profile(
     profile: Option<&str>,
     roots: &[PathBuf],
     preferred_profile_markers: &[&str],
 ) -> Option<PathBuf> {
     if let Some(profile) = profile {
         if looks_like_path(profile) {
-            let p = PathBuf::from(profile);
-            let candidate = if profile.ends_with("cookies.sqlite") {
-                p
+            let path = PathBuf::from(profile);
+            let profile_dir = if path.ends_with("cookies.sqlite") {
+                path.parent()?.to_path_buf()
             } else {
-                p.join("cookies.sqlite")
+                path
             };
-            return if candidate.exists() {
-                Some(candidate)
-            } else {
-                None
-            };
+            return profile_dir.is_dir().then_some(profile_dir);
         }
     }
 
@@ -258,8 +306,8 @@ fn resolve_firefox_cookies_db(
             continue;
         }
         if let Some(profile) = profile {
-            let candidate = root.join(profile).join("cookies.sqlite");
-            if candidate.exists() {
+            let candidate = root.join(profile);
+            if candidate.is_dir() {
                 return Some(candidate);
             }
             continue;
@@ -271,8 +319,8 @@ fn resolve_firefox_cookies_db(
             .find_map(|marker| entries.iter().find(|e| e.contains(marker)));
         let picked = preferred_profile.or(entries.first());
         if let Some(picked) = picked {
-            let candidate = root.join(picked).join("cookies.sqlite");
-            if candidate.exists() {
+            let candidate = root.join(picked);
+            if candidate.is_dir() {
                 return Some(candidate);
             }
         }
@@ -356,32 +404,90 @@ fn looks_like_path(value: &str) -> bool {
     value.contains('/') || value.contains('\\')
 }
 
-fn copy_sidecar(source_db_path: &Path, temp_db_path: &Path, suffix: &str) {
-    let sidecar = PathBuf::from(format!("{}{}", source_db_path.to_string_lossy(), suffix));
-    let target = PathBuf::from(format!("{}{}", temp_db_path.to_string_lossy(), suffix));
+fn copy_sidecar(source_db_path: &Path, temp_db_path: &Path, suffix: &str) -> Result<(), String> {
+    let with_suffix = |path: &Path| {
+        let mut path = path.as_os_str().to_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
+    };
+    let sidecar = with_suffix(source_db_path);
+    let target = with_suffix(temp_db_path);
     if sidecar.exists() {
-        let _ = std::fs::copy(&sidecar, &target);
+        std::fs::copy(&sidecar, target)
+            .map_err(|error| format!("copy {}: {error}", sidecar.display()))?;
     }
+    Ok(())
 }
 
-fn build_host_where_clause(hosts: &[String]) -> String {
-    let mut clauses = Vec::new();
-    for host in hosts {
-        let escaped = sql_literal(host);
-        let escaped_dot = sql_literal(&format!(".{host}"));
-        let escaped_like = sql_literal(&format!("%.{host}"));
-        clauses.push(format!("host = {escaped}"));
-        clauses.push(format!("host = {escaped_dot}"));
-        clauses.push(format!("host LIKE {escaped_like}"));
-    }
-    if clauses.is_empty() {
-        "1=0".to_string()
-    } else {
-        clauses.join(" OR ")
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lz4_flex::block::compress_prepend_size;
 
-fn sql_literal(value: &str) -> String {
-    let escaped = value.replace('\'', "''");
-    format!("'{escaped}'")
+    #[test]
+    fn reads_filtered_sessionstore_cookies() {
+        let profile_dir = tempfile::tempdir().unwrap();
+        let backups = profile_dir.path().join("sessionstore-backups");
+        std::fs::create_dir(&backups).unwrap();
+
+        let json = serde_json::json!({
+            "cookies": [
+                {
+                    "host": ".spotify.com",
+                    "name": "sp_dc",
+                    "value": "isolated-value",
+                    "originAttributes": { "userContextId": 1 }
+                },
+                {
+                    "host": ".spotify.com",
+                    "name": "sp_dc",
+                    "value": "session-value",
+                    "path": "/",
+                    "secure": true,
+                    "httponly": true,
+                    "sameSite": 0
+                }
+            ]
+        });
+        let mut encoded = MOZLZ4_HEADER.to_vec();
+        encoded.extend(compress_prepend_size(&serde_json::to_vec(&json).unwrap()));
+        std::fs::write(backups.join("recovery.jsonlz4"), encoded).unwrap();
+
+        let source = CookieSource {
+            browser: BrowserName::Zen,
+            profile: Some("main".to_string()),
+            origin: None,
+            store_id: None,
+        };
+        let cookies: Vec<_> = read_firefox_sessionstore(profile_dir.path())
+            .unwrap()
+            .into_iter()
+            .filter_map(|cookie| {
+                cookie.into_cookie(
+                    &["open.spotify.com".to_string()],
+                    Some(&HashSet::from(["sp_dc".to_string()])),
+                    false,
+                    0,
+                    &source,
+                )
+            })
+            .collect();
+
+        assert_eq!(cookies.len(), 1);
+        let cookie = &cookies[0];
+        assert_eq!(cookie.name, "sp_dc");
+        assert_eq!(cookie.value, "session-value");
+        assert_eq!(cookie.domain.as_deref(), Some("spotify.com"));
+        assert_eq!(cookie.path.as_deref(), Some("/"));
+        assert_eq!(cookie.secure, Some(true));
+        assert_eq!(cookie.http_only, Some(true));
+        assert_eq!(cookie.same_site, Some(CookieSameSite::None));
+        assert_eq!(
+            cookie
+                .source
+                .as_ref()
+                .and_then(|source| source.profile.as_deref()),
+            Some("main")
+        );
+    }
 }
